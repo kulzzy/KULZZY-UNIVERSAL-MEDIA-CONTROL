@@ -1,4 +1,4 @@
-// Kulzzy Media Control deployment trigger
+// Kulzzy Universal Media Control
 import { DurableObject } from "cloudflare:workers";
 
 const ALLOWED_ORIGINS = [
@@ -31,6 +31,61 @@ export default {
       });
     }
 
+    // NEW: Durable Object diagnostic
+    if (url.pathname === "/diagnostic") {
+      if (
+        request.method !== "GET" ||
+        (origin && !ALLOWED_ORIGINS.includes(origin))
+      ) {
+        return Response.json(
+          { error: "Diagnostic request not permitted" },
+          { status: 403, headers: cors(origin) }
+        );
+      }
+
+      try {
+        const id = env.MEDIA_CONTROL.idFromName(
+          "kulzzy-global-playback"
+        );
+
+        const diagnosticRequest = new Request(
+          "https://media-control.internal/diagnostic"
+        );
+
+        const result = await env.MEDIA_CONTROL
+          .get(id)
+          .fetch(diagnosticRequest);
+
+        const data = await result.json();
+
+        return Response.json({
+          service: "Kulzzy Universal Media Control",
+          worker: "online",
+          durableObject: "reachable",
+          ...data
+        }, {
+          headers: {
+            ...cors(origin),
+            "Cache-Control": "no-store"
+          }
+        });
+
+      } catch (error) {
+        return Response.json({
+          service: "Kulzzy Universal Media Control",
+          worker: "online",
+          durableObject: "error",
+          message: String(error && error.message || error)
+        }, {
+          status: 503,
+          headers: {
+            ...cors(origin),
+            "Cache-Control": "no-store"
+          }
+        });
+      }
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -53,19 +108,40 @@ export default {
       }, { headers: cors(origin) });
     }
 
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    if (
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+    ) {
       return new Response("WebSocket upgrade required", {
         status: 426
       });
     }
 
-    const id = env.MEDIA_CONTROL.idFromName("kulzzy-global-playback");
+    const id = env.MEDIA_CONTROL.idFromName(
+      "kulzzy-global-playback"
+    );
+
     return env.MEDIA_CONTROL.get(id).fetch(request);
   }
 };
 
 export class MediaControl extends DurableObject {
+
   async fetch(request) {
+
+    // NEW: Diagnostic request from the Worker
+    if (
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+    ) {
+      const active = await this.ctx.storage.get("activePlayback");
+
+      return Response.json({
+        durableObject: "online",
+        websocketConnections: this.ctx.getWebSockets().length,
+        hasActivePlayback: Boolean(active),
+        activeSource: active?.source || null
+      });
+    }
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -141,6 +217,7 @@ export class MediaControl extends DurableObject {
         type: "playback-confirmed",
         activePlayback: active
       }));
+
       return;
     }
 
@@ -159,6 +236,7 @@ export class MediaControl extends DurableObject {
           } catch {}
         }
       }
+
       return;
     }
 
