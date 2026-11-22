@@ -1,3 +1,4 @@
+// Kulzzy Media Control deployment trigger
 import { DurableObject } from "cloudflare:workers";
 
 const ALLOWED_ORIGINS = [
