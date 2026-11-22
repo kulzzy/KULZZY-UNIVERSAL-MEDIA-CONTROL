@@ -1,0 +1,20 @@
+{
+  "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
+  "name": "kulzzy-media-control",
+  "main": "index.js",
+  "compatibility_date": "2026-11-22",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MEDIA_CONTROL",
+        "class_name": "MediaControl"
+      }
+    ]
+  },
+  "exports": {
+    "MediaControl": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
