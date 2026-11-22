@@ -1,18 +1,16 @@
 /* =====================================================
    KULZZY UNIVERSAL MEDIA CONTROL
-   VERSION 4.0
+   VERSION 4.1
    Cross-device playback coordination
-   Heartbeat and stale-session protection
+   Heartbeat protection and stale-session cleanup
 ===================================================== */
 
 (function () {
   "use strict";
 
-  if (window.KULZZY_UNIVERSAL_MEDIA_CONTROL) {
-    return;
-  }
+  if (window.KULZZY_UNIVERSAL_MEDIA_CONTROL) return;
 
-  const VERSION = "4.0";
+  const VERSION = "4.1";
 
   const FIREBASE_CONFIG = {
     apiKey: "AIzaSyDVq__Tr9pxBL6pSTqZVOEOLRVN9sYtYzc",
@@ -31,31 +29,24 @@
   const HEARTBEAT_INTERVAL = 15000;
   const SESSION_TIMEOUT = 60000;
 
-  const PLAYER_CONFIG =
-    window.KULZZY_MEDIA_PLAYER_CONFIG || {};
+  const PLAYER_CONFIG = window.KULZZY_MEDIA_PLAYER_CONFIG || {};
 
   const PLAYER_ID = String(
-    PLAYER_CONFIG.playerId ||
-    location.hostname + location.pathname
+    PLAYER_CONFIG.playerId || location.hostname + location.pathname
   );
 
   const PLAYER_NAME = String(
     PLAYER_CONFIG.playerName || PLAYER_ID
   );
 
-  const MEDIA_SELECTOR =
-    PLAYER_CONFIG.mediaSelector || "audio,video";
+  const MEDIA_SELECTOR = PLAYER_CONFIG.mediaSelector || "audio,video";
 
   function createId() {
-    if (
-      window.crypto &&
-      typeof window.crypto.randomUUID === "function"
-    ) {
-      return window.crypto.randomUUID().replace(/-/g, "");
+    if (window.crypto && crypto.randomUUID) {
+      return crypto.randomUUID().replace(/-/g, "");
     }
 
-    return "s" +
-      Date.now().toString(36) +
+    return "s" + Date.now().toString(36) +
       Math.random().toString(36).slice(2);
   }
 
@@ -71,11 +62,10 @@
 
   let ready = false;
   let connected = false;
-
   let wantsPlayback = false;
   let registeredPlaying = false;
-
   let stoppingByController = false;
+
   let heartbeatTimer = null;
   let stopResetTimer = null;
   let stopCheckTimer = null;
@@ -83,27 +73,18 @@
   let operationQueue = Promise.resolve();
   let startedAt = null;
   let serverTimeOffset = 0;
-
   let mediaChannel = null;
   let monitorAttached = false;
 
   const scriptLoads = Object.create(null);
 
-  /* =========================
-     SCRIPT LOADER
-  ========================= */
-
   function loadScript(url) {
-    if (scriptLoads[url]) {
-      return scriptLoads[url];
-    }
+    if (scriptLoads[url]) return scriptLoads[url];
 
     scriptLoads[url] = new Promise(function (resolve, reject) {
       const script = document.createElement("script");
-
       script.src = url;
       script.async = true;
-
       script.onload = resolve;
 
       script.onerror = function () {
@@ -116,10 +97,6 @@
 
     return scriptLoads[url];
   }
-
-  /* =========================
-     FIREBASE INITIALIZATION
-  ========================= */
 
   async function initializeFirebase() {
     const base =
@@ -144,22 +121,14 @@
     auth = firebaseApp.auth();
     database = firebaseApp.database();
 
-    const offsetRef = database.ref(".info/serverTimeOffset");
-
-    offsetRef.on("value", function (snapshot) {
+    database.ref(".info/serverTimeOffset").on("value", function (snapshot) {
       serverTimeOffset = Number(snapshot.val()) || 0;
     });
   }
 
-  /* =========================
-     MEDIA HELPERS
-  ========================= */
-
   function getMediaElements() {
     try {
-      return Array.from(
-        document.querySelectorAll(MEDIA_SELECTOR)
-      );
+      return Array.from(document.querySelectorAll(MEDIA_SELECTOR));
     } catch (error) {
       console.error("[Kulzzy Media] Invalid media selector.", error);
       return [];
@@ -171,10 +140,6 @@
       return !media.paused && !media.ended;
     });
   }
-
-  /* =========================
-     SAME-BROWSER CONTROL
-  ========================= */
 
   try {
     if ("BroadcastChannel" in window) {
@@ -200,10 +165,6 @@
     }
   }
 
-  /* =========================
-     SERIALIZED FIREBASE WORK
-  ========================= */
-
   function queueOperation(operation) {
     operationQueue = operationQueue
       .then(operation)
@@ -214,10 +175,53 @@
     return operationQueue;
   }
 
+  function stopHeartbeat() {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+
+    if (!wantsPlayback || !registeredPlaying) return;
+
+    heartbeatTimer = setInterval(function () {
+      if (
+        !ready ||
+        !connected ||
+        !wantsPlayback ||
+        !registeredPlaying ||
+        stoppingByController ||
+        !sessionRef
+      ) {
+        return;
+      }
+
+      queueOperation(async function () {
+        if (
+          !wantsPlayback ||
+          !registeredPlaying ||
+          stoppingByController ||
+          !connected
+        ) {
+          return;
+        }
+
+        await sessionRef.update({
+          lastSeen: firebase.database.ServerValue.TIMESTAMP
+        });
+      });
+
+    }, HEARTBEAT_INTERVAL);
+  }
+
   function removeRegistration() {
+    stopHeartbeat();
+
     return queueOperation(async function () {
       if (!sessionRef) {
         registeredPlaying = false;
+        startedAt = null;
         return;
       }
 
@@ -240,10 +244,8 @@
         return;
       }
 
-      const currentTime = Date.now() + serverTimeOffset;
-
       if (!startedAt) {
-        startedAt = firebase.database.ServerValue.TIMESTAMP;
+        startedAt = Date.now() + serverTimeOffset;
       }
 
       await sessionRef.set({
@@ -255,22 +257,18 @@
         lastSeen: firebase.database.ServerValue.TIMESTAMP
       });
 
-      registeredPlaying = true;
-
-      /*
-       * A stop may have occurred while Firebase
-       * was processing the registration.
-       * The next queued operation removes it.
-       */
-
       if (!wantsPlayback || stoppingByController) {
         await sessionRef.remove();
 
         registeredPlaying = false;
         startedAt = null;
+        stopHeartbeat();
 
         return;
       }
+
+      registeredPlaying = true;
+      startHeartbeat();
 
       console.log(
         "[Kulzzy Media] Playback registered:",
@@ -278,45 +276,6 @@
       );
     });
   }
-
-  function heartbeat() {
-    if (
-      !ready ||
-      !connected ||
-      !wantsPlayback ||
-      !registeredPlaying ||
-      !sessionRef
-    ) {
-      return;
-    }
-
-    queueOperation(async function () {
-      if (
-        !wantsPlayback ||
-        stoppingByController ||
-        !connected
-      ) {
-        return;
-      }
-
-      await sessionRef.update({
-        lastSeen: firebase.database.ServerValue.TIMESTAMP
-      });
-    });
-  }
-
-  function startHeartbeat() {
-    clearInterval(heartbeatTimer);
-
-    heartbeatTimer = setInterval(
-      heartbeat,
-      HEARTBEAT_INTERVAL
-    );
-  }
-
-  /* =========================
-     PLAY / STOP NOTIFICATIONS
-  ========================= */
 
   function notifyPlay() {
     if (stoppingByController) return;
@@ -333,18 +292,12 @@
   function notifyStop(force) {
     clearTimeout(stopCheckTimer);
 
-    if (!force && isLocallyPlaying()) {
-      return;
-    }
+    if (!force && isLocallyPlaying()) return;
 
     wantsPlayback = false;
 
     removeRegistration();
   }
-
-  /* =========================
-     STOP LOCAL PLAYER
-  ========================= */
 
   function stopLocalPlayer(reason) {
     if (stoppingByController) return;
@@ -353,7 +306,7 @@
     wantsPlayback = false;
 
     clearTimeout(stopCheckTimer);
-    clearInterval(heartbeatTimer);
+    stopHeartbeat();
 
     const detail = {
       reason: reason || "another-player-started",
@@ -365,9 +318,7 @@
     };
 
     window.dispatchEvent(
-      new CustomEvent("kulzzy:media-stop", {
-        detail: detail
-      })
+      new CustomEvent("kulzzy:media-stop", { detail: detail })
     );
 
     window.postMessage({
@@ -379,19 +330,14 @@
       try {
         PLAYER_CONFIG.stop(detail);
       } catch (error) {
-        console.error(
-          "[Kulzzy Media] Custom stop failed.",
-          error
-        );
+        console.error("[Kulzzy Media] Custom stop failed.", error);
       }
     }
 
     getMediaElements().forEach(function (media) {
       try {
         media.pause();
-      } catch (error) {
-        console.warn("[Kulzzy Media] Could not pause media.", error);
-      }
+      } catch (error) {}
     });
 
     removeRegistration();
@@ -403,10 +349,6 @@
     }, 1200);
   }
 
-  /* =========================
-     SESSION FRESHNESS
-  ========================= */
-
   function getWinningSession(snapshot) {
     const now = Date.now() + serverTimeOffset;
     const active = [];
@@ -415,16 +357,9 @@
       uidNode.forEach(function (sessionNode) {
         const data = sessionNode.val();
 
-        if (!data || data.playing !== true) {
-          return;
-        }
+        if (!data || data.playing !== true) return;
 
         const lastSeen = Number(data.lastSeen) || 0;
-
-        /*
-         * Ignore old sessions that have stopped
-         * sending heartbeat updates.
-         */
 
         if (
           !lastSeen ||
@@ -438,9 +373,7 @@
           uid: uidNode.key,
           playerId: data.playerId || sessionNode.key,
           playerName:
-            data.playerName ||
-            data.playerId ||
-            "Kulzzy Player",
+            data.playerName || data.playerId || "Kulzzy Player",
           sessionId: data.sessionId || sessionNode.key,
           startedAt: Number(data.startedAt) || 0,
           lastSeen: lastSeen
@@ -459,23 +392,15 @@
     return active.length ? active[0] : null;
   }
 
-  /* =========================
-     CROSS-DEVICE MONITOR
-  ========================= */
-
   function monitorPlayers() {
-    if (monitorAttached || !playersRef) {
-      return;
-    }
+    if (monitorAttached || !playersRef) return;
 
     monitorAttached = true;
 
     playersRef.on("value", function (snapshot) {
       const winner = getWinningSession(snapshot);
 
-      if (!winner) {
-        return;
-      }
+      if (!winner) return;
 
       const isOwnSession =
         winner.uid === userId &&
@@ -496,25 +421,15 @@
     });
   }
 
-  /* =========================
-     BROWSER TAB MESSAGES
-  ========================= */
-
   function handleChannelMessage(event) {
     const message = event && event.data;
 
     if (
       !message ||
-      message.type !== "KULZZY_MEDIA_PLAY"
+      message.type !== "KULZZY_MEDIA_PLAY" ||
+      message.sessionId === SESSION_ID ||
+      !message.playerId
     ) {
-      return;
-    }
-
-    if (message.sessionId === SESSION_ID) {
-      return;
-    }
-
-    if (!message.playerId) {
       return;
     }
 
@@ -527,29 +442,15 @@
   }
 
   if (mediaChannel) {
-    mediaChannel.addEventListener(
-      "message",
-      handleChannelMessage
-    );
+    mediaChannel.addEventListener("message", handleChannelMessage);
   }
 
-  /* =========================
-     MEDIA EVENT MONITOR
-  ========================= */
-
   function handleMediaEvent(event) {
-    if (stoppingByController) {
-      return;
-    }
+    if (stoppingByController) return;
 
     const media = event.target;
 
-    if (
-      !media ||
-      typeof media.matches !== "function"
-    ) {
-      return;
-    }
+    if (!media || typeof media.matches !== "function") return;
 
     let matches = false;
 
@@ -559,14 +460,9 @@
       return;
     }
 
-    if (!matches) {
-      return;
-    }
+    if (!matches) return;
 
-    if (
-      event.type === "play" ||
-      event.type === "playing"
-    ) {
+    if (event.type === "play" || event.type === "playing") {
       notifyPlay();
       return;
     }
@@ -593,29 +489,16 @@
     "ended",
     "error"
   ].forEach(function (eventName) {
-    document.addEventListener(
-      eventName,
-      handleMediaEvent,
-      true
-    );
+    document.addEventListener(eventName, handleMediaEvent, true);
   });
 
-  /* =========================
-     FIREBASE CONNECTION
-  ========================= */
-
   async function setupUser(user) {
-    if (!user || userId === user.uid) {
-      return;
-    }
+    if (!user || userId === user.uid) return;
 
     userId = user.uid;
 
     sessionRef = database.ref(
-      "control/players/" +
-      userId +
-      "/" +
-      SESSION_ID
+      "control/players/" + userId + "/" + SESSION_ID
     );
 
     playersRef = database.ref("control/players");
@@ -626,10 +509,7 @@
 
     monitorPlayers();
 
-    console.log(
-      "[Kulzzy Media] Connected:",
-      PLAYER_NAME
-    );
+    console.log("[Kulzzy Media] Connected:", PLAYER_NAME);
 
     if (isLocallyPlaying()) {
       wantsPlayback = true;
@@ -638,39 +518,33 @@
   }
 
   function monitorConnection() {
-    database.ref(".info/connected").on(
-      "value",
-      async function (snapshot) {
-        connected = snapshot.val() === true;
+    database.ref(".info/connected").on("value", async function (snapshot) {
+      connected = snapshot.val() === true;
 
-        if (!connected) {
-          registeredPlaying = false;
-          return;
-        }
+      if (!connected) {
+        registeredPlaying = false;
+        stopHeartbeat();
+        return;
+      }
 
-        console.log("[Kulzzy Media] Firebase connected.");
+      console.log("[Kulzzy Media] Firebase connected.");
 
-        if (sessionRef) {
-          try {
-            await sessionRef.onDisconnect().remove();
-          } catch (error) {
-            console.error(
-              "[Kulzzy Media] Reconnection setup failed.",
-              error
-            );
-          }
-        }
-
-        if (wantsPlayback && !stoppingByController) {
-          registerPlayback();
+      if (sessionRef) {
+        try {
+          await sessionRef.onDisconnect().remove();
+        } catch (error) {
+          console.error(
+            "[Kulzzy Media] Reconnection setup failed.",
+            error
+          );
         }
       }
-    );
-  }
 
-  /* =========================
-     AUTHENTICATION
-  ========================= */
+      if (wantsPlayback && !stoppingByController) {
+        registerPlayback();
+      }
+    });
+  }
 
   async function initialize() {
     try {
@@ -678,28 +552,22 @@
 
       monitorConnection();
 
-      auth.onAuthStateChanged(
-        async function (user) {
-          try {
-            if (user) {
-              await setupUser(user);
-            } else {
-              await auth.signInAnonymously();
-            }
-          } catch (error) {
-            console.error(
-              "[Kulzzy Media] Authentication setup failed.",
-              error
-            );
+      auth.onAuthStateChanged(async function (user) {
+        try {
+          if (user) {
+            await setupUser(user);
+          } else {
+            await auth.signInAnonymously();
           }
-        },
-        function (error) {
+        } catch (error) {
           console.error(
-            "[Kulzzy Media] Authentication failed.",
+            "[Kulzzy Media] Authentication setup failed.",
             error
           );
         }
-      );
+      }, function (error) {
+        console.error("[Kulzzy Media] Authentication failed.", error);
+      });
 
     } catch (error) {
       console.error(
@@ -709,14 +577,10 @@
     }
   }
 
-  /* =========================
-     PAGE CLEANUP
-  ========================= */
-
   function cleanup() {
     wantsPlayback = false;
 
-    clearInterval(heartbeatTimer);
+    stopHeartbeat();
     clearTimeout(stopCheckTimer);
 
     if (sessionRef) {
@@ -732,17 +596,11 @@
 
   window.addEventListener("pagehide", cleanup);
 
-  /* =========================
-     PUBLIC CONTROLLER API
-  ========================= */
-
   window.KULZZY_UNIVERSAL_MEDIA_CONTROL = {
     version: VERSION,
-
     playerId: PLAYER_ID,
     playerName: PLAYER_NAME,
     sessionId: SESSION_ID,
-
     notifyPlay: notifyPlay,
     notifyStop: notifyStop,
     stop: stopLocalPlayer,
